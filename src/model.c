@@ -29,25 +29,24 @@ static int alloc_run_state(Transformer *t) {
     t->att    = calloc((size_t)p->n_heads * (size_t)p->seq_len, sizeof(float));
     t->logits = calloc((size_t)p->vocab_size, sizeof(float));
 
-    size_t cache_elems = (size_t)p->n_layers * (size_t)p->seq_len * (size_t)kv_dim;
-    t->key_cache   = calloc(cache_elems, sizeof(float));
-    t->value_cache = calloc(cache_elems, sizeof(float));
-
     if (!t->x || !t->xb || !t->xb2 || !t->hb || !t->hb2 || !t->q || !t->k || !t->v ||
-        !t->att || !t->logits || !t->key_cache || !t->value_cache) {
+        !t->att || !t->logits) {
         fprintf(stderr, "initium/model: OOM allocating run state\n");
         return -1;
     }
+
+    if (kvcache_init(&t->kv, p->n_layers, p->n_kv_heads, hd, p->seq_len) != 0) {
+        return -1;
+    }
+
     return 0;
 }
 
 static void free_run_state(Transformer *t) {
     free(t->x); free(t->xb); free(t->xb2); free(t->hb); free(t->hb2);
     free(t->q); free(t->k); free(t->v); free(t->att); free(t->logits);
-    free(t->key_cache); free(t->value_cache);
     t->x = t->xb = t->xb2 = t->hb = t->hb2 = NULL;
     t->q = t->k = t->v = t->att = t->logits = NULL;
-    t->key_cache = t->value_cache = NULL;
 }
 
 static int alloc_weight_ptrs(ModelWeights *w, int n_layers) {
@@ -225,17 +224,15 @@ int model_load_llama2c_bin(Transformer *t, const char *path, int ctx_override) {
     }
 
     t->use_kv_cache = 1;
-    t->pool = threadpool_create(0);
-    kernels_set_threadpool(t->pool);
 
     if (alloc_run_state(t) != 0) {
         model_free(t);
         return -1;
     }
 
-    fprintf(stderr, "initium: loaded llama2c bin dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d seq=%d tied=%d thr=%d\n",
+    fprintf(stderr, "initium: loaded llama2c bin dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d seq=%d tied=%d\n",
             p->dim, p->hidden_dim, p->n_layers, p->n_heads, p->n_kv_heads, p->vocab_size, p->seq_len,
-            p->tied_embeddings, threadpool_num_threads(t->pool));
+            p->tied_embeddings);
     return 0;
 }
 
@@ -411,8 +408,6 @@ int model_load_gguf(Transformer *t, const char *path, int ctx_override) {
 
     t->w.owns_blob = 2; /* special: free each pointer separately */
     t->use_kv_cache = 1;
-    t->pool = threadpool_create(0);
-    kernels_set_threadpool(t->pool);
 
     if (alloc_run_state(t) != 0) {
         gguf_close(&gf);
@@ -420,8 +415,7 @@ int model_load_gguf(Transformer *t, const char *path, int ctx_override) {
         return -1;
     }
 
-    fprintf(stderr, "initium: GGUF ready (fp32 weights in RAM, threads=%d)\n",
-            threadpool_num_threads(t->pool));
+    fprintf(stderr, "initium: GGUF ready (fp32 weights in RAM)\n");
     gguf_close(&gf);
     return 0;
 }
@@ -454,30 +448,6 @@ void model_free(Transformer *t) {
     memset(t, 0, sizeof(*t));
 }
 
-/* RoPE exactly as karpathy/llama2.c:
- * for i in 0..dim step 2:
- *   head_dim = i % head_size
- *   freq = theta^(-head_dim/head_size)
- * rotate q always; rotate k only when i < kv_dim
- */
-static void rope_llama2c(float *q, float *k, int dim, int kv_dim, int head_size,
-                         int pos, float theta_base) {
-    for (int i = 0; i < dim; i += 2) {
-        int head_dim = i % head_size;
-        float freq = 1.0f / powf(theta_base, (float)head_dim / (float)head_size);
-        float val = (float)pos * freq;
-        float fcr = cosf(val);
-        float fci = sinf(val);
-        int rotn = (i < kv_dim) ? 2 : 1;
-        for (int v = 0; v < rotn; v++) {
-            float *vec = (v == 0) ? q : k;
-            float v0 = vec[i];
-            float v1 = vec[i + 1];
-            vec[i]     = v0 * fcr - v1 * fci;
-            vec[i + 1] = v0 * fci + v1 * fcr;
-        }
-    }
-}
 
 float *model_forward(Transformer *t, int token, int pos) {
     ModelConfig *p = &t->cfg;
@@ -511,20 +481,13 @@ float *model_forward(Transformer *t, int token, int pos) {
         rope_llama2c(t->q, t->k, dim, kv_dim, hd, pos, p->rope_theta);
 
         /* write key/value cache for this layer at pos */
-        {
-            size_t loff = (size_t)l * (size_t)p->seq_len * (size_t)kv_dim;
-            float *key_row = t->key_cache + loff + (size_t)pos * kv_dim;
-            float *val_row = t->value_cache + loff + (size_t)pos * kv_dim;
-            vec_copy(key_row, t->k, kv_dim);
-            vec_copy(val_row, t->v, kv_dim);
-        }
+        kvcache_append(&t->kv, l, pos, t->k, t->v);
 
         /* multi-head attention — head outputs into xb (llama2.c layout), then wo -> xb2 */
         for (int h = 0; h < n_heads; h++) {
             float *q = t->q + h * hd;
             float *att = t->att + h * p->seq_len;
             int kv_head = h / kv_mul;
-            size_t loff = (size_t)l * (size_t)p->seq_len * (size_t)kv_dim;
 
             int start = 0;
             if (p->sliding_window > 0 && (pos + 1) > p->sliding_window) {
@@ -532,7 +495,7 @@ float *model_forward(Transformer *t, int token, int pos) {
             }
 
             for (int tpos = start; tpos <= pos; tpos++) {
-                float *krow = t->key_cache + loff + (size_t)tpos * kv_dim + (size_t)kv_head * hd;
+                float *krow = kvcache_k_head(&t->kv, l, kv_head, tpos);
                 float score = dot(q, krow, hd) / sqrtf((float)hd);
                 att[tpos] = score;
             }
@@ -547,7 +510,7 @@ float *model_forward(Transformer *t, int token, int pos) {
             float *xb = t->xb + h * hd;
             memset(xb, 0, (size_t)hd * sizeof(float));
             for (int tpos = start; tpos <= pos; tpos++) {
-                float *vrow = t->value_cache + loff + (size_t)tpos * kv_dim + (size_t)kv_head * hd;
+                float *vrow = kvcache_v_head(&t->kv, l, kv_head, tpos);
                 float a = att[tpos];
                 for (int i = 0; i < hd; i++) {
                     xb[i] += a * vrow[i];

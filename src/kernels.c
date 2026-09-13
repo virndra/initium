@@ -4,6 +4,20 @@
 #include <math.h>
 #include <string.h>
 
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#define INITIUM_HAS_AVX2 1
+#else
+#define INITIUM_HAS_AVX2 0
+#endif
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#define INITIUM_HAS_NEON 1
+#else
+#define INITIUM_HAS_NEON 0
+#endif
+
 int g_initium_no_simd = 0;
 static ThreadPool *g_pool = NULL;
 
@@ -25,7 +39,7 @@ void rmsnorm(float *y, const float *x, const float *weight, int n, float eps) {
 
 typedef struct { float *y; const float *x; const float *w; int cols; } MatmulArgs;
 
-static void matmul_slice(int start, int end, void *ud) {
+static void matmul_slice_scalar(int start, int end, void *ud) {
     MatmulArgs *a = (MatmulArgs *)ud;
     for (int r = start; r < end; r++) {
         const float *row = a->w + (size_t)r * (size_t)a->cols;
@@ -33,6 +47,64 @@ static void matmul_slice(int start, int end, void *ud) {
         for (int c = 0; c < a->cols; c++) sum += row[c] * a->x[c];
         a->y[r] = sum;
     }
+}
+
+#if INITIUM_HAS_AVX2
+static void matmul_slice_avx2(int start, int end, void *ud) {
+    MatmulArgs *a = (MatmulArgs *)ud;
+    int cols = a->cols;
+    for (int r = start; r < end; r++) {
+        const float *row = a->w + (size_t)r * (size_t)cols;
+        __m256 sum = _mm256_setzero_ps();
+        int c = 0;
+        for (; c + 7 < cols; c += 8) {
+            __m256 vw = _mm256_loadu_ps(row + c);
+            __m256 vx = _mm256_loadu_ps(a->x + c);
+            sum = _mm256_fmadd_ps(vw, vx, sum);
+        }
+        __m128 lo = _mm256_castps256_ps128(sum);
+        __m128 hi = _mm256_extractf128_ps(sum, 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        float s = _mm_cvtss_f32(lo);
+        for (; c < cols; c++) s += row[c] * a->x[c];
+        a->y[r] = s;
+    }
+}
+#endif
+
+#if INITIUM_HAS_NEON
+static void matmul_slice_neon(int start, int end, void *ud) {
+    MatmulArgs *a = (MatmulArgs *)ud;
+    int cols = a->cols;
+    for (int r = start; r < end; r++) {
+        const float *row = a->w + (size_t)r * (size_t)cols;
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        int c = 0;
+        for (; c + 3 < cols; c += 4) {
+            float32x4_t vw = vld1q_f32(row + c);
+            float32x4_t vx = vld1q_f32(a->x + c);
+            sum = vfmaq_f32(sum, vw, vx);
+        }
+        float s = vaddvq_f32(sum);
+        for (; c < cols; c++) s += row[c] * a->x[c];
+        a->y[r] = s;
+    }
+}
+#endif
+
+static void matmul_slice(int start, int end, void *ud) {
+    if (!g_initium_no_simd) {
+#if INITIUM_HAS_AVX2
+        matmul_slice_avx2(start, end, ud);
+        return;
+#elif INITIUM_HAS_NEON
+        matmul_slice_neon(start, end, ud);
+        return;
+#endif
+    }
+    matmul_slice_scalar(start, end, ud);
 }
 
 void matmul(float *y, const float *x, const float *w, int rows, int cols) {
@@ -83,12 +155,60 @@ void vec_copy(float *dst, const float *src, int n) {
     memcpy(dst, src, (size_t)n * sizeof(float));
 }
 
-float dot(const float *a, const float *b, int n) {
+static float dot_scalar(const float *a, const float *b, int n) {
     float s = 0.0f;
     for (int i = 0; i < n; i++) {
         s += a[i] * b[i];
     }
     return s;
+}
+
+#if INITIUM_HAS_AVX2
+static float dot_avx2(const float *a, const float *b, int n) {
+    __m256 sum = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        sum = _mm256_fmadd_ps(va, vb, sum);
+    }
+    /* horizontal sum of 8 floats */
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float s = _mm_cvtss_f32(lo);
+    /* scalar tail */
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+#endif
+
+#if INITIUM_HAS_NEON
+static float dot_neon(const float *a, const float *b, int n) {
+    float32x4_t sum = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        sum = vfmaq_f32(sum, va, vb);
+    }
+    float s = vaddvq_f32(sum);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+#endif
+
+float dot(const float *a, const float *b, int n) {
+    if (!g_initium_no_simd) {
+#if INITIUM_HAS_AVX2
+        return dot_avx2(a, b, n);
+#elif INITIUM_HAS_NEON
+        return dot_neon(a, b, n);
+#endif
+    }
+    return dot_scalar(a, b, n);
 }
 
 int argmax_f32(const float *x, int n) {
@@ -103,9 +223,33 @@ int argmax_f32(const float *x, int n) {
     return best;
 }
 
-/* Interleaved-pair RoPE (llama.cpp / GGUF convention after conversion).
- * For pair (2i, 2i+1): angle = pos * theta_base^(-2i/head_dim) */
-void rope(float *q, float *k, int head_dim, int pos, float theta_base) {
+/* RoPE — karpathy/llama2.c convention (production path).
+ * Iterates over the full concatenated dim, computing freq from i % head_size.
+ * Rotates q always; rotates k only when i < kv_dim (for GQA). */
+void rope_llama2c(float *q, float *k, int dim, int kv_dim, int head_size,
+                  int pos, float theta_base) {
+    for (int i = 0; i < dim; i += 2) {
+        int head_dim = i % head_size;
+        float freq = 1.0f / powf(theta_base, (float)head_dim / (float)head_size);
+        float val = (float)pos * freq;
+        float fcr = cosf(val);
+        float fci = sinf(val);
+        int rotn = (i < kv_dim) ? 2 : 1;
+        for (int v = 0; v < rotn; v++) {
+            float *vec = (v == 0) ? q : k;
+            float v0 = vec[i];
+            float v1 = vec[i + 1];
+            vec[i]     = v0 * fcr - v1 * fci;
+            vec[i + 1] = v0 * fci + v1 * fcr;
+        }
+    }
+}
+
+/* RoPE — interleaved-pair convention (GGUF/NEOX/llama.cpp style).
+ * Operates on a single head of head_dim floats.
+ * For pair (2i, 2i+1): angle = pos * theta_base^(-2i/head_dim).
+ * Retained for future GGUF models that use this convention. */
+void rope_neox(float *q, float *k, int head_dim, int pos, float theta_base) {
     for (int i = 0; i < head_dim; i += 2) {
         float freq = 1.0f / powf(theta_base, ((float)i) / (float)head_dim);
         float val = (float)pos * freq;
@@ -122,12 +266,12 @@ void rope(float *q, float *k, int head_dim, int pos, float theta_base) {
     }
 }
 
-void rope_all(float *q, float *k, int n_heads, int n_kv_heads, int head_dim,
-              int pos, float theta_base) {
+void rope_neox_all(float *q, float *k, int n_heads, int n_kv_heads, int head_dim,
+                   int pos, float theta_base) {
     for (int h = 0; h < n_heads; h++) {
-        rope(q + h * head_dim, NULL, head_dim, pos, theta_base);
+        rope_neox(q + h * head_dim, NULL, head_dim, pos, theta_base);
     }
     for (int h = 0; h < n_kv_heads; h++) {
-        rope(k + h * head_dim, NULL, head_dim, pos, theta_base);
+        rope_neox(k + h * head_dim, NULL, head_dim, pos, theta_base);
     }
 }

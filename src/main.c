@@ -62,7 +62,7 @@ static void usage(const char *argv0) {
         "  --top-k <int>    (default 40)\n"
         "  --seed <int>     RNG seed\n"
         "  --ctx <int>      context override\n"
-        "  --threads <int>  (default 1 for now)\n"
+        "  --threads <int>  worker threads (default: auto-detect)\n"
         "  --greedy         force argmax\n"
         "  --verify <path>  parity mode vs reference dump\n"
         "  --stats          tokens/sec on stderr\n"
@@ -81,7 +81,7 @@ static int parse_args(int argc, char **argv, Options *o) {
     o->temperature = 0.8f;
     o->top_p = 0.95f;
     o->top_k = 40;
-    o->threads = 1;
+    o->threads = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) o->model_path = argv[++i];
         else if (!strcmp(argv[i], "--tokenizer") && i + 1 < argc) o->tokenizer_path = argv[++i];
@@ -259,6 +259,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Create thread pool with user-specified count (0 = auto-detect) */
+    model.pool = threadpool_create(opt.threads);
+    kernels_set_threadpool(model.pool);
+
     Tokenizer tok;
     memset(&tok, 0, sizeof(tok));
     if (ends_with(opt.model_path, ".gguf") || ends_with(opt.model_path, ".GGUF")) {
@@ -302,10 +306,7 @@ int main(int argc, char **argv) {
             if (n == 0) break;
             generate(&model, &tok, &samp, &opt, line);
             /* reset caches between turns for simplicity */
-            memset(model.key_cache, 0, (size_t)model.cfg.n_layers * model.cfg.seq_len *
-                   (model.cfg.dim / model.cfg.n_heads) * model.cfg.n_kv_heads * sizeof(float));
-            memset(model.value_cache, 0, (size_t)model.cfg.n_layers * model.cfg.seq_len *
-                   (model.cfg.dim / model.cfg.n_heads) * model.cfg.n_kv_heads * sizeof(float));
+            kvcache_clear(&model.kv);
         }
     } else {
         rc = generate(&model, &tok, &samp, &opt, opt.prompt ? opt.prompt : "");

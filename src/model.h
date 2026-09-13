@@ -65,10 +65,6 @@ typedef struct {
     float *v;
     float *att;
     float *logits;
-
-    /* For M1 no-cache mode: full key/value history */
-    float *key_cache;   /* n_layers * seq_len * n_kv_heads * hd */
-    float *value_cache;
 } Transformer;
 
 int  model_load_llama2c_bin(Transformer *t, const char *path, int ctx_override);

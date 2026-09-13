@@ -30,15 +30,23 @@ void residual_add(float *y, const float *a, const float *b, int n);
 /* Copy n floats */
 void vec_copy(float *dst, const float *src, int n);
 
-/* RoPE (interleaved pairs, GGUF/llama.cpp convention).
- * x: head_dim floats for one head; pos: absolute position; theta_base from model.
- * head_dim must be even. */
-void rope(float *q, float *k, int head_dim, int pos, float theta_base);
+/* RoPE — karpathy/llama2.c convention (production path for llama2.c .bin models).
+ * Iterates over the full concatenated dim, computing freq from i % head_size.
+ * Rotates q (dim floats) always; rotates k only when i < kv_dim (for GQA).
+ * head_size must be even. */
+void rope_llama2c(float *q, float *k, int dim, int kv_dim, int head_size,
+                  int pos, float theta_base);
 
-/* Apply RoPE to all query heads and KV heads.
+/* RoPE — interleaved-pair convention (GGUF/NEOX/llama.cpp style).
+ * Operates on a single head of head_dim floats.
+ * For pair (2i, 2i+1): angle = pos * theta_base^(-2i/head_dim).
+ * head_dim must be even. */
+void rope_neox(float *q, float *k, int head_dim, int pos, float theta_base);
+
+/* Apply per-head NEOX RoPE to all query heads and KV heads.
  * q: n_heads * head_dim, k: n_kv_heads * head_dim */
-void rope_all(float *q, float *k, int n_heads, int n_kv_heads, int head_dim,
-              int pos, float theta_base);
+void rope_neox_all(float *q, float *k, int n_heads, int n_kv_heads, int head_dim,
+                   int pos, float theta_base);
 
 /* Dot product of two length-n vectors */
 float dot(const float *a, const float *b, int n);
